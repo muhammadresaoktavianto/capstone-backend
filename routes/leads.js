@@ -12,7 +12,10 @@ const loadCSV = async (db) => {
 
   try {
     const filePath = path.join(__dirname, "../ml/nasabah/X_test_rf.csv");
-    if (!fs.existsSync(filePath)) return console.log("CSV tidak ditemukan:", filePath);
+    if (!fs.existsSync(filePath)) {
+      console.log("CSV tidak ditemukan:", filePath);
+      return;
+    }
 
     const csvFile = fs.readFileSync(filePath, "utf8");
     const parsed = Papa.parse(csvFile, { header: true, skipEmptyLines: true });
@@ -26,7 +29,7 @@ const loadCSV = async (db) => {
       try {
         let leadScore = 0;
         try {
-          const flaskResponse = await axios.post("http://localhost:8000/predict", row);
+          const flaskResponse = await axios.post(`${process.env.ML_URL}/predict`, row);
           leadScore = Math.round((flaskResponse.data.probability ?? 0) * 100);
         } catch (err) {
           console.error("❌ Error prediksi model:", err.message);
@@ -81,7 +84,7 @@ const createLeadsRouter = (db) => {
     let leadScore = 0;
 
     try {
-      const flaskResponse = await axios.post("http://localhost:8000/predict", data);
+      const flaskResponse = await axios.post(`${process.env.ML_URL}/predict`, data);
       leadScore = Math.round((flaskResponse.data.probability ?? 0) * 100);
     } catch (err) {
       console.error("❌ Error prediksi model:", err.message);
@@ -136,86 +139,77 @@ const createLeadsRouter = (db) => {
     });
   });
 
-  /// PATCH /leads/:id
-router.patch("/:id", async (req, res) => {
-  const leadId = req.params.id;
-  const newData = req.body;
+  // PATCH /leads/:id → update status & aktivitas
+  router.patch("/:id", async (req, res) => {
+    const leadId = req.params.id;
+    const newData = req.body;
 
-  try {
-    const [oldData] = await new Promise((resolve, reject) => {
-      db.query("SELECT * FROM leads WHERE id = ?", [leadId], (err, results) => {
-        if (err) return reject(err);
-        resolve(results);
+    try {
+      const [oldData] = await new Promise((resolve, reject) => {
+        db.query("SELECT * FROM leads WHERE id = ?", [leadId], (err, results) => {
+          if (err) return reject(err);
+          resolve(results);
+        });
       });
-    });
 
-    if (!oldData) return res.status(404).json({ success: false, message: "Nasabah tidak ditemukan." });
+      if (!oldData) return res.status(404).json({ success: false, message: "Nasabah tidak ditemukan." });
 
-    // Parse aktivitas lama
-    let oldAktivitas = [];
-    try { oldAktivitas = JSON.parse(oldData.aktivitas || "[]"); } catch { oldAktivitas = []; }
+      let oldAktivitas = [];
+      try { oldAktivitas = JSON.parse(oldData.aktivitas || "[]"); } catch { oldAktivitas = []; }
 
-    // Tambahkan aktivitas baru jika ada update status_kampanye
-    if (newData.status_kampanye) {
-      const now = new Date();
-      const nextCampaign = Number(newData.campaign) || (oldAktivitas.length + 1);
-      const durationSec = Number(newData.duration) || Number(oldData.duration) || 480;
+      if (newData.status_kampanye) {
+        const now = new Date();
+        const nextCampaign = Number(newData.campaign) || (oldAktivitas.length + 1);
+        const durationSec = Number(newData.duration) || Number(oldData.duration) || 480;
 
- const newActivity = {
-  id: Date.now(),
-  month: now.toLocaleString('id-ID', { month: 'long' }),
-  day: now.getDate(),
-  duration: durationSec,
-  campaign: nextCampaign,
-  // simpan di poutcome, bukan outcome
-  poutcome: newData.status_kampanye.toLowerCase() === 'interest' ? 'success' : 'failure',
-  alasan: newData.alasan_status || '',
-  subscription_status: newData.subscription_status || oldData.subscription_status || 'not subscribed',
-  timestamp: now.toISOString()
-};
+        const newActivity = {
+          id: Date.now(),
+          month: now.toLocaleString('id-ID', { month: 'long' }),
+          day: now.getDate(),
+          duration: durationSec,
+          campaign: nextCampaign,
+          poutcome: newData.status_kampanye.toLowerCase() === 'interest' ? 'success' : 'failure',
+          alasan: newData.alasan_status || '',
+          subscription_status: newData.subscription_status || oldData.subscription_status || 'not subscribed',
+          timestamp: now.toISOString()
+        };
 
+        oldAktivitas.push(newActivity);
+      }
 
+      const fields = [];
+      const values = [];
 
-      oldAktivitas.push(newActivity);
-    }
+      if (newData.status_kampanye) {
+        fields.push("status_kampanye=?");
+        values.push(newData.status_kampanye);
+      }
+      if (newData.alasan_status) {
+        fields.push("alasan_status=?");
+        values.push(newData.alasan_status);
+      }
+      if (newData.subscription_status) {
+        fields.push("subscription_status=?");
+        values.push(newData.subscription_status);
+      }
+      if (oldAktivitas) {
+        fields.push("aktivitas=?");
+        values.push(JSON.stringify(oldAktivitas));
+      }
 
-    // Bangun query partial update
-    const fields = [];
-    const values = [];
+      values.push(leadId);
 
-    if (newData.status_kampanye) {
-      fields.push("status_kampanye=?");
-      values.push(newData.status_kampanye);
-    }
-    if (newData.alasan_status) {
-      fields.push("alasan_status=?");
-      values.push(newData.alasan_status);
-    }
-    if (newData.subscription_status) {
-      fields.push("subscription_status=?");
-      values.push(newData.subscription_status);
-    }
-    if (oldAktivitas) {
-      fields.push("aktivitas=?");
-      values.push(JSON.stringify(oldAktivitas));
-    }
+      const sql = `UPDATE leads SET ${fields.join(", ")} WHERE id=?`;
 
-    values.push(leadId);
-
-    const sql = `UPDATE leads SET ${fields.join(", ")} WHERE id=?`;
-
-    db.query(sql, values, (err) => {
-      if (err) return res.status(500).json({ success: false, message: err.message });
-      res.json({ success: true, message: "Data nasabah berhasil diperbarui." });
-    });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ success: false, message: "Terjadi kesalahan server." });
+      db.query(sql, values, (err) => {
+        if (err) return res.status(500).json({ success: false, message: err.message });
+        res.json({ success: true, message: "Data nasabah berhasil diperbarui." });
+      });
+    } catch (err) {
+      console.error(err);
+      res.status(500).json({ success: false, message: "Terjadi kesalahan server." });
   }
 });
-
-
-
   return router;
 };
 
